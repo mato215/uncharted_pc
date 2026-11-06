@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include "bbport_toggles.h"
@@ -430,6 +431,9 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    /// bbport: gc_tick at each of the last 64 seconds, for idle ages in seconds.
+    u64 gc_second = 0;
+    std::array<u64, 64> gc_tick_at_second{};
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;

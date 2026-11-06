@@ -1250,21 +1250,41 @@ void TextureCache::GarbageCollectImages() {
             }
         }
     }
+    // bbport (from the Bloodborne port, a6675ea): gc_tick (one per guest submission, hundreds a
+    // second) at each of the last 64 seconds, for ages in seconds. Below 8 GB the collect mark
+    // is 0, and an age of 16 ticks (~3 frames) evicted every texture briefly off screen and
+    // uploaded it again: ~550 a minute in Uncharted 1 with 3.5 GB of the budget free. Below the
+    // pressure mark an image now goes once unused for BB_GC_IDLE_SECONDS (20): the textures of
+    // an area left behind. Cards under ~5.5 GB (tight_budget) keep their own ages.
+    const u64 second = u64(std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+    if (second != gc_second) {
+        gc_second = second;
+        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+    }
     if (total_used_memory < trigger_gc_memory && !urgent_pass) {
         return;
     }
+    static const u64 idle_seconds = [] {
+        const char* env = std::getenv("BB_GC_IDLE_SECONDS");
+        return std::clamp<u64>(env ? std::strtoull(env, nullptr, 10) : 20, 1, 63);
+    }();
+    // The tick at the start of that second (an older one where no submission came then).
+    const u64 idle_tick = gc_tick_at_second[(second - idle_seconds) % gc_tick_at_second.size()];
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
-    u64 ticks_to_destroy = 0;
+    u64 below_tick = 0;
     size_t num_deletions = 0;
+    u32 visited = 0;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         // bbport: critical used 160 ticks, longer than pressure's 80, so the aggressive pass
         // never freed more than the first one (#256).
-        ticks_to_destroy = aggresive ? 40 : pressured ? 80 : 16;
+        u64 ticks_to_destroy = aggresive ? 40 : pressured ? 80 : 16;
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
         if (tight_budget) {
             // Pressure widens the set of eviction candidates here (it narrowed it).
@@ -1276,22 +1296,28 @@ void TextureCache::GarbageCollectImages() {
             }
         }
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
+        below_tick = gc_tick - ticks_to_destroy;
+        if (!pressured && !aggresive && !tight_budget) {
+            below_tick = std::min(below_tick, idle_tick);
+        }
+        visited = 0;
     };
     const auto clean_up = [&](ImageId image_id) {
-        if (num_deletions == 0) {
+        if (num_deletions == 0 || ++visited > 256) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
+        // bbport (a6675ea): images that cannot go now (GPU-written: their contents exist only
+        // here, and tiled ones cannot be written back at all) neither use up the deletions nor
+        // stay first in line. Once the oldest ten were such render targets, every pass spent
+        // its deletions on them and freed nothing, and VRAM grew with every area visited.
+        if ((tiled && download) || (download && !pressured)) {
+            lru_cache.Touch(image.lru_id, gc_tick);
             return false;
         }
-        if (download && !pressured) {
-            return false;
-        }
+        --num_deletions;
         if (download) {
             // bbport: synchronously, while the image still protects its pages. A deferred
             // write-back landed after FreeImage had unprotected them, over whatever the game
@@ -1317,12 +1343,12 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    lru_cache.ForEachItemBelow(below_tick, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        lru_cache.ForEachItemBelow(below_tick, clean_up);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
     if (pressured || gc_downloads != 0) {
@@ -1338,6 +1364,23 @@ void TextureCache::GarbageCollectImages() {
                         (unsigned long long)(registered_image_bytes >> 20));
             gc_report_time = now;
             gc_evictions = gc_downloads = 0;
+        }
+    } else if (gc_evictions != 0) {
+        // bbport (from the Bloodborne port, 4009083): evictions by the idle rule too, at most
+        // every 5 s, so two runs compare. Below 8 GB the collect mark is 0 and this rule runs
+        // all session.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - gc_report_time >= std::chrono::seconds(5)) {
+            std::printf("Texture cache: %llu of %llu MiB: %llu idle images evicted since the last "
+                        "report (textures %llu MiB)\n",
+                        (unsigned long long)(total_used_memory >> 20),
+                        (unsigned long long)(pressure_gc_memory >> 20),
+                        (unsigned long long)gc_evictions,
+                        (unsigned long long)(Vulkan::Vram::image_bytes.load(
+                                                 std::memory_order_relaxed) >>
+                                             20));
+            gc_report_time = now;
+            gc_evictions = 0;
         }
     }
 }
